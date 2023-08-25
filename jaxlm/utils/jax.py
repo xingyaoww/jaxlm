@@ -104,7 +104,7 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
 def set_random_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
-    init_rng(seed)
+    init_global_rng(seed)
 
 
 def get_jax_mesh(axis_dims, names):
@@ -169,11 +169,14 @@ def wrap_function_with_rng(rng):
 
 
 def init_rng(seed):
+    return JaxRNG.from_seed(seed)
+
+def init_global_rng(seed):
     global jax_utils_rng
-    jax_utils_rng = JaxRNG.from_seed(seed)
+    jax_utils_rng = init_rng(seed)
 
 
-def next_rng(*args, **kwargs):
+def next_global_rng(*args, **kwargs):
     global jax_utils_rng
     return jax_utils_rng(*args, **kwargs)
 
@@ -200,31 +203,6 @@ def mse_loss(val, target, valid=None):
         )
     )
     return loss
-
-
-def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
-    if valid is None:
-        valid = jnp.ones(tokens.shape[:2])
-    valid = valid.astype(jnp.float32)
-    valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-    logits = logits.astype(jnp.float32) # for numerical stability
-    token_log_prob = jnp.squeeze(
-        jnp.take_along_axis(
-            jax.nn.log_softmax(logits, axis=-1),
-            jnp.expand_dims(tokens, -1),
-            axis=-1,
-        ),
-        -1,
-    )
-    token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
-    loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
-    correct = jnp.where(
-        valid > 0.0,
-        jnp.argmax(logits, axis=-1) == tokens,
-        jnp.array(False)
-    )
-    accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
-    return loss, accuracy
 
 
 def global_norm(tree):
