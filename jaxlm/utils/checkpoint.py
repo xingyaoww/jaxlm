@@ -7,8 +7,8 @@ from flax.serialization import (
 from flax.traverse_util import flatten_dict, unflatten_dict, empty_node
 import msgpack
 
-import jaxlm.jaxlm.utils.file as fileutils
-from jaxlm.jaxlm.utils.jax import tree_apply, float_tensor_to_dtype
+import jaxlm.utils.file as fileutils
+from jaxlm.utils.jax import tree_apply, float_tensor_to_dtype
 
 
 class StreamingCheckpointer(object):
@@ -60,7 +60,7 @@ class StreamingCheckpointer(object):
             path = '/dev/null'
         fileutils.save_pickle(obj, path)
 
-    def save_all(self, train_state, gather_fns, metadata=None, dataset=None, milestone=False):
+    def save_all(self, train_state, gather_fns, metadata=None, milestone=False):
         step = int(jax.device_get(train_state.step))
         if self.save_optimizer_state:
             checkpoint_state = train_state
@@ -74,14 +74,12 @@ class StreamingCheckpointer(object):
         if milestone:
             # Save a milestone checkpoint that will not be overwritten
             self.save_pickle(metadata, f'metadata_{step}.pkl')
-            self.save_pickle(dataset, f'dataset_{step}.pkl')
             self.save_checkpoint(
                 checkpoint_state, f'{checkpoint_name}_{step}', checkpoint_gather_fns
             )
         else:
             # Save a normal checkpoint that can be overwritten
             self.save_pickle(metadata, 'metadata.pkl')
-            self.save_pickle(dataset, 'dataset.pkl')
             self.save_checkpoint(
                 checkpoint_state, f'{checkpoint_name}', checkpoint_gather_fns
             )
