@@ -8,5 +8,10 @@ setup(
     author_email='xingyao6@illinois.edu',
     description='A simplistic Jax-based Language Model Training and Serving Framework.',
     url='https://github.com/xingyaoww/jaxlm',
-    license='MIT',
+    license='Apache License 2.0',
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
 )

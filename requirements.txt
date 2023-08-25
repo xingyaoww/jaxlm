@@ -1,0 +1,9 @@
+transformers
+datasets
+aiohttp
+fastapi
+httpx
+pydantic<2,>=1
+shortuuid
+tiktoken
+uvicorn
