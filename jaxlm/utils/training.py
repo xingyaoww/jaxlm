@@ -2,32 +2,63 @@ from typing import Mapping, Tuple, Optional, Callable
 import jax
 import jax.numpy as jnp
 import flax.core
+from flax.training.common_utils import onehot
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from jaxlm.utils.jax import (
-    JaxRNG, next_rng, match_partition_rules,
-    cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
-    set_random_seed, average_metrics, get_weight_decay_mask,
-    make_shard_and_gather_fns, with_sharding_constraint,
+    JaxRNG,
+    global_norm,
+    with_sharding_constraint,
 )
 from functools import partial
 
 INPUT_TOKEN_KEY = "input_ids"
 LABELS_KEY = "labels"
-LOSS_MASK_KEY = "loss_masks"  # NOTE: loss is only calculated for loss_masks == 1
+LOSS_WEIGHT_KEY = "loss_weight"  # =0 are masked out
 
-def loss_and_accuracy(params, batch, rng, model=None):
+
+def cross_entropy_loss(logits, labels, loss_weight=None):
+    # shift logits and labels
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+
+    token_log_prob = jnp.squeeze(
+        jnp.take_along_axis(
+            jax.nn.log_softmax(shift_logits, axis=-1),
+            jnp.expand_dims(shift_labels, -1),
+            axis=-1,
+        ),
+        -1,
+    )
+
+    # We do not avg for each batch due to minibatch implementation
+    loss = -jnp.sum(loss_weight * token_log_prob)
+
+    valid_mask = loss_weight != 0.0
+    n_correct = jnp.sum(
+        jnp.where(
+            valid_mask,
+            jnp.argmax(shift_logits, axis=-1) == shift_labels,
+            jnp.array(False)
+        )
+    )
+    return loss, {
+        "n_correct": n_correct,
+        "n_tokens": jnp.sum(valid_mask),
+    }
+
+
+def loss_and_metrics(params, batch, rng_output, model=None):
     batch = with_sharding_constraint(
         batch, PS(('dp', 'fsdp'))
     )
     logits = model.apply(
         params, batch[INPUT_TOKEN_KEY], deterministic=False,
-        rngs=rng,
+        rngs=rng_output,
     ).logits
-    loss, accuracy = cross_entropy_loss_and_accuracy(
-        logits, batch[LABELS_KEY], batch[LOSS_MASK_KEY]
+    return cross_entropy_loss(
+        logits, batch[LABELS_KEY], batch[LOSS_WEIGHT_KEY]
     )
-    return loss, {'accuracy': accuracy}
 
 
 def get_microbatch(batch: dict, idx: int, microbatch_size: int) -> Mapping[str, jnp.ndarray]:
@@ -44,28 +75,25 @@ def get_microbatch(batch: dict, idx: int, microbatch_size: int) -> Mapping[str, 
     }
 
 
-def train_step_microbatched(
-    train_state, batch,
-    rng, rng_keys,
+def train_step(
+    train_state,
+    batch,
+    rng_output,
     model=None,
     num_microbatches: int = 1,
     accum_dtype=jnp.float32,
     learning_rate_schedule: Callable[[int], float] = None,
 ):
-    """Implements optional microbatched gradient accumulation.
+    """Train model with (optional) microbatched gradient accumulation.
 
     Args:
-    loss_fn: The loss function that takes in (train_state.params, batch, dropout_rng).
     train_state: A train state with model parameters and optimizer state.
     batch: A batch of data.
-    dropout_rng: jax PRNGKey for dropout.
+    rng_output: jax PRNGKey output for model (e.g., for dropout).
+        Instead of RNG, this make sure that the same random number is used for all microbatches.
+        That is, the setting of num_microbatches should have no effect on the training result.
     num_microbatches: the number of microbatches to use, or None for direct
         training.
-    data_partition_spec: the PartitionSpec to use for partitioning annotations
-        on the batch.
-
-    Returns:
-    Accumulated gradients and incremental metrics.
     """
     batch_size = batch[INPUT_TOKEN_KEY].shape[0]
     microbatch_size = batch_size // num_microbatches
@@ -74,12 +102,12 @@ def train_step_microbatched(
         f'microbatches ({num_microbatches}).'
     )
 
-    loss_and_accuracy_fn = partial(loss_and_accuracy, model=model)
+    loss_and_metrics_fn = partial(loss_and_metrics, model=model)
     get_microbatch_fn = partial(
         get_microbatch, microbatch_size=microbatch_size)
-    grad_fn = jax.value_and_grad(loss_and_accuracy_fn, has_aux=True)
+    grad_fn = jax.value_and_grad(loss_and_metrics_fn, has_aux=True)
 
-    def calculate_grad(loop_cnt, rng):
+    def calculate_grad(loop_cnt):
         mbatch = get_microbatch_fn(batch, loop_cnt)
         # We need to annotate the microbatch sharding as we would do to a batch.
         mbatch = jax.tree_util.tree_map(
@@ -89,19 +117,19 @@ def train_step_microbatched(
         (loss, metrics), grad = grad_fn(
             train_state.params,
             mbatch,
-            rng,
+            rng_output,
         )
         return loss, grad, metrics
 
     def per_microbatch_train_step(
         loop_cnt: int,
-        state: Tuple[jnp.ndarray, jnp.ndarray,
+        state: Tuple[jnp.ndarray,
                      Mapping[str, jnp.ndarray],
                      Optional[flax.core.FrozenDict]]
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, Mapping[str, jnp.ndarray],
+    ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray],
                Optional[flax.core.FrozenDict]]:
-        (rng, loss_accum, grad_accum, metrics_accum) = state
-        loss, grad, metrics = calculate_grad(loop_cnt, rng)
+        (loss_accum, grad_accum, metrics_accum) = state
+        loss, grad, metrics = calculate_grad(loop_cnt)
 
         # convert to accum_dtype
         loss = loss.astype(accum_dtype)
@@ -117,7 +145,7 @@ def train_step_microbatched(
             jnp.add, metrics_accum, metrics
         )
         grad_accum = jax.tree_util.tree_map(jnp.add, grad_accum, grad)
-        return rng, loss_accum, grad_accum, metrics_accum
+        return loss_accum, grad_accum, metrics_accum
 
     # Initialize gradient accumulation loop state.
     loss_accum_init = jnp.zeros((), accum_dtype)
@@ -126,11 +154,8 @@ def train_step_microbatched(
         train_state.params
     )
 
-    rng_generator = JaxRNG(rng)
-    input_rng = rng_generator(rng_keys)
     _, _, initial_metrics_shape = jax.eval_shape(
-        calculate_grad, loop_cnt=0,
-        rng=input_rng
+        calculate_grad, loop_cnt=0
     )
 
     metrics_accum_init = {
@@ -138,42 +163,57 @@ def train_step_microbatched(
         for k in initial_metrics_shape
     }
     loop_init = (
-        input_rng,  # same rng for all microbatches
         loss_accum_init,
         grad_accum_init,
         metrics_accum_init
     )
-    _, loss_accum, grad_accum, metrics_accum = jax.lax.fori_loop(
+    loss_accum, grad_accum, metrics_accum = jax.lax.fori_loop(
         0, num_microbatches, per_microbatch_train_step, loop_init
+    )
+
+    # normalize loss and gradient by number of tokens
+    num_tokens = metrics_accum['n_tokens']
+    # only normalize if num_tokens > 0
+
+    def _normalize(loss, grad, num_tokens):
+        loss = loss / num_tokens
+        grad = jax.tree_map(lambda x: x / num_tokens, grad)
+        return loss, grad
+
+    loss_accum, grad_accum = jax.lax.cond(
+        num_tokens > 0,
+        lambda x: _normalize(*x),
+        lambda x: x[:-1],  # noop, return loss, grad
+        (loss_accum, grad_accum, num_tokens)
     )
 
     # Apply the gradients to the model.
     train_state = train_state.apply_gradients(grads=grad_accum)
     metrics = dict(
-        loss=loss_accum / num_microbatches,
-        accuracy=metrics_accum['accuracy'] / num_microbatches,
+        loss=loss_accum,
+        accuracy=metrics_accum['n_correct'] / metrics_accum['n_tokens'],
         learning_rate=learning_rate_schedule(train_state.step),
         gradient_norm=global_norm(grad_accum),
         param_norm=global_norm(train_state.params),
     )
-    new_rng = rng_generator()
-    return train_state, new_rng, metrics
+    return train_state, rng_output, metrics
 
 
 def eval_step(
-    train_state, batch, rng, rng_keys, model=None,
+    train_state,
+    batch,
+    rng_output,
+    model=None,
 ):
-    rng_generator = JaxRNG(rng)
-    batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-    logits = model.apply(
-        train_state.params, batch[INPUT_TOKEN_KEY], deterministic=True,
-        rngs=rng_generator(rng_keys),
-    ).logits
-    loss, accuracy = cross_entropy_loss_and_accuracy(
-        logits, batch[LABELS_KEY], batch[LOSS_MASK_KEY]
+    loss, metrics = loss_and_metrics(
+        train_state.params,
+        batch,
+        rng_output,
+        model=model
     )
     metrics = dict(
         eval_loss=loss,
-        eval_accuracy=accuracy,
+        eval_accuracy=metrics["n_correct"] / metrics["n_tokens"],
+        **{f"eval_{k}": v for k, v in metrics.items()}
     )
-    return rng_generator(), metrics
+    return metrics
